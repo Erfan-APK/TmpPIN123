@@ -1,0 +1,1018 @@
+"""
+Physics-Informed Neural Network (PINN) for 2D NACA 0012 Cascade Flow Simulation
+GPU-Accelerated implementation using PyTorch with CUDA support
+Corrections:
+- Pitch-aware periodicity and geometry
+- Sobol collocation sampling + mini-batch training
+- Input normalization to [-1, 1]
+- Zero-gradient outlet BC
+- Full stress-based force integration (Cauchy traction) on a closed CCW contour
+
+Change applied: Adjusted loss weighting to strongly prioritize airfoil (no-slip) BC
+and inlet BC to help reduce artificial slip at the surface (improve drag prediction).
+"""
+
+import warnings
+warnings.filterwarnings('ignore')
+
+import time
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from torch.quasirandom import SobolEngine
+from torch.cuda.amp import autocast, GradScaler
+
+# Device setup
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
+if device.type == 'cuda':
+    print(f"GPU: {torch.cuda.get_device_name(0)}")
+    print(f"Memory Allocated: {torch.cuda.memory_allocated(0) / 1024 ** 2:.2f} MB")
+
+# Reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(42)
+
+
+def sobol_points(n, x_min, x_max, y_min, y_max, device):
+    # Sobol sequences have a limit (typically 2^20 points)
+    MAX_SOBOL = 1048576  # 2^20
+
+    if n > MAX_SOBOL:
+        # Fallback to uniform random sampling for large n
+        print(f"Warning: Requested {n} Sobol points exceeds limit {MAX_SOBOL}, using random sampling")
+        x = x_min + (x_max - x_min) * torch.rand(n, 1, device=device)
+        y = y_min + (y_max - y_min) * torch.rand(n, 1, device=device)
+    else:
+        try:
+            sobol = SobolEngine(dimension=2, scramble=True, seed=42)
+            xy = sobol.draw(n).to(torch.float32).to(device)
+            x = x_min + (x_max - x_min) * xy[:, :1]
+            y = y_min + (y_max - y_min) * xy[:, 1:2]
+        except RuntimeError as e:
+            # Fallback if Sobol fails
+            print(f"Sobol sampling failed with n={n}, using random sampling. Error: {e}")
+            x = x_min + (x_max - x_min) * torch.rand(n, 1, device=device)
+            y = y_min + (y_max - y_min) * torch.rand(n, 1, device=device)
+
+    return x, y
+
+
+class NACA0012:
+    """NACA 0012 airfoil geometry"""
+    def __init__(self, chord=1.0, t=0.12):
+        self.chord = chord
+        self.t = t
+
+    def surface(self, x):
+        """Calculate y-coordinate of NACA 0012 surface for given x"""
+        xc = torch.clamp(x / self.chord, 0.0, 1.0)
+        yt = 5 * self.t * (
+            0.2969 * torch.sqrt(xc) -
+            0.1260 * xc -
+            0.3516 * xc**2 +
+            0.2843 * xc**3 -
+            0.1015 * xc**4
+        )
+        return yt * self.chord
+
+    def is_inside(self, x, y, pitch=None):  # pitch kept for compatibility but unused
+        """Check if point (x,y) is inside the airfoil"""
+        x_valid = (x >= 0.0) & (x <= self.chord)
+        y_surface = self.surface(x)
+        inside = x_valid & (torch.abs(y) <= y_surface)
+        return inside
+
+
+class PINN(nn.Module):
+    """Physics-Informed Neural Network for incompressible Navier-Stokes in 2D"""
+    def __init__(self, layers, Re=200.0, x_min=-2.0, x_max=4.0, y_min=-0.5, y_max=0.5):
+        super().__init__()
+        self.Re = Re
+
+        # Input normalization buffers
+        self.register_buffer('x_mean', torch.tensor(0.5 * (x_min + x_max), dtype=torch.float32))
+        self.register_buffer('x_scale', torch.tensor(0.5 * (x_max - x_min), dtype=torch.float32))
+        self.register_buffer('y_mean', torch.tensor(0.5 * (y_min + y_max), dtype=torch.float32))
+        self.register_buffer('y_scale', torch.tensor(0.5 * (y_max - y_min), dtype=torch.float32))
+
+        # Build MLP
+        self.layers = nn.ModuleList()
+        for i in range(len(layers) - 1):
+            self.layers.append(nn.Linear(layers[i], layers[i + 1]))
+
+        # Xavier init
+        for layer in self.layers:
+            nn.init.xavier_normal_(layer.weight)
+            nn.init.zeros_(layer.bias)
+
+    def forward(self, x, y):
+        """Network maps (x,y) -> (u,v,p)"""
+        if x.dim() == 1:
+            x = x.unsqueeze(1)
+        if y.dim() == 1:
+            y = y.unsqueeze(1)
+
+        # Normalize to [-1, 1]
+        x_n = (x - self.x_mean) / (self.x_scale + 1e-12)
+        y_n = (y - self.y_mean) / (self.y_scale + 1e-12)
+        z = torch.cat([x_n, y_n], dim=1)
+
+        # for layer in self.layers[:-1]:
+        #     z = torch.tanh(layer(z))
+
+        for i, layer in enumerate(self.layers[:-1]):
+            z = layer(z)
+            if i < len(self.layers) - 2:  # Don't apply to last hidden layer
+                z = torch.nn.functional.gelu(z)  # GELU often better for PINNs
+        out = self.layers[-1](z)
+
+        u = out[:, 0:1]
+        v = out[:, 1:2]
+        p = out[:, 2:3]
+        return u, v, p
+
+    def physics_loss(self, x, y):
+        """Navier-Stokes residuals at collocation points"""
+        # Always create fresh tensors with gradients enabled for physics loss
+        x = x.clone().detach().requires_grad_(True)
+        y = y.clone().detach().requires_grad_(True)
+
+        u, v, p = self.forward(x, y)
+
+        # First derivatives
+        u_x = torch.autograd.grad(u, x, torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        u_y = torch.autograd.grad(u, y, torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        v_x = torch.autograd.grad(v, x, torch.ones_like(v), retain_graph=True, create_graph=True)[0]
+        v_y = torch.autograd.grad(v, y, torch.ones_like(v), retain_graph=True, create_graph=True)[0]
+        p_x = torch.autograd.grad(p, x, torch.ones_like(p), retain_graph=True, create_graph=True)[0]
+        p_y = torch.autograd.grad(p, y, torch.ones_like(p), retain_graph=True, create_graph=True)[0]
+
+        # Second derivatives
+        u_xx = torch.autograd.grad(u_x, x, torch.ones_like(u_x), retain_graph=True, create_graph=True)[0]
+        u_yy = torch.autograd.grad(u_y, y, torch.ones_like(u_y), retain_graph=True, create_graph=True)[0]
+        v_xx = torch.autograd.grad(v_x, x, torch.ones_like(v_x), retain_graph=True, create_graph=True)[0]
+        v_yy = torch.autograd.grad(v_y, y, torch.ones_like(v_y), retain_graph=True, create_graph=True)[0]
+
+        # Residuals
+        # Residuals
+        momentum_x = u * u_x + v * u_y + p_x - (1.0 / self.Re) * (u_xx + u_yy)
+        momentum_y = u * v_x + v * v_y + p_y - (1.0 / self.Re) * (v_xx + v_yy)
+        continuity = u_x + v_y
+
+        return momentum_x, momentum_y, continuity
+
+
+class CascadeFlowSolver:
+    """Main solver for cascade flow around NACA 0012 airfoils"""
+    def __init__(self, Re=200, chord=1.0, solidity=1.0):
+        self.Re = Re
+        self.chord = chord
+        self.solidity = solidity
+        self.pitch = chord / max(solidity, 1e-8)
+
+        # Domain bounds: extended downstream
+        # self.x_min, self.x_max = -2.0, 4.0 #the less previous band
+        self.x_min, self.x_max = -3.0, 6.0
+        # Increase channel height to reduce wall effects
+        self.y_min = -1.0  # More reasonable for cascade
+        self.y_max = 1.0
+
+        # Geometry
+        self.airfoil = NACA0012(chord=self.chord, t=0.12)
+
+        # Model - wider network
+        layers = [2, 128, 128, 128, 128, 128, 128, 3]
+        self.model = PINN(layers, Re=self.Re,
+                          x_min=self.x_min, x_max=self.x_max,
+                          y_min=self.y_min, y_max=self.y_max).to(device)
+
+        # Optimizer with lower initial LR
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=5e-5, weight_decay=1e-6)
+
+        # Use OneCycleLR for better convergence
+        self.scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            self.optimizer,
+            max_lr=2e-4,  # Reduced from 5e-4
+            epochs=8000,
+            steps_per_epoch=1,
+            pct_start=0.3,  # 30% warmup
+            anneal_strategy='cos',
+            final_div_factor=100
+        )
+        # Mixed precision training for speed
+        self.scaler = GradScaler()
+        self.use_amp = True  # Enable mixed precision
+
+
+        # Training history
+        self.loss_history = []
+        # Adaptive weighting parameters
+        self.use_adaptive_weights = True
+        self.adaptive_alpha = 0.9  # exponential moving average
+        self.warmup_epochs = 1000  # Increased for better initial convergence
+
+        # Initialize weight tracking
+        self.loss_weights = {
+            'physics': 1.0,
+            'inlet': 1.0,
+            'outlet': 1.0,
+            'airfoil': 1.0,
+            'wall': 1.0
+        }
+        self.grad_norms = {k: None for k in self.loss_weights.keys()}
+        self.weight_history = []  # Track weight evolution
+
+        # Toggle adaptive resampling (optional)
+        #self.use_residual_adaptive = False  # set True to enable
+        self.use_residual_adaptive = True
+        self.adaptive_start_epoch = 2000  # Start adaptive sampling after warmup
+
+    def generate_collocation_points(self, n_domain=40000, n_boundary=8000):
+        """Generate collocation points (Sobol) and boundary points"""
+        # Domain: sample extra and filter inside airfoil
+        x_dom, y_dom = sobol_points(n_domain * 3, self.x_min, self.x_max, self.y_min, self.y_max, device)
+        inside = self.airfoil.is_inside(x_dom, y_dom, pitch=self.pitch)
+        x_dom, y_dom = x_dom[~inside][:n_domain], y_dom[~inside][:n_domain]
+
+        # Inlet boundary (x = x_min)
+        n_inlet = n_boundary // 4
+        x_inlet = torch.full((n_inlet, 1), self.x_min, device=device)
+        y_inlet = self.y_min + (self.y_max - self.y_min) * torch.rand(n_inlet, 1, device=device)
+
+        # Outlet boundary (x = x_max)
+        n_outlet = n_boundary // 4
+        x_outlet = torch.full((n_outlet, 1), self.x_max, device=device)
+        y_outlet = self.y_min + (self.y_max - self.y_min) * torch.rand(n_outlet, 1, device=device)
+
+        # Airfoil surface (cosine-clustered closed CCW contour)
+        # Airfoil surface with extra clustering at leading edge
+        n_airfoil = n_boundary  # Use all boundary points for airfoil
+        # Use power law for stronger LE clustering
+        t = torch.linspace(0, 1, n_airfoil // 2 + 1, device=device)
+        s = np.pi * (1 - (1 - t) ** 2)  # Stronger clustering at LE
+        x_nodes = 0.5 * (1.0 - torch.cos(s)) * self.chord
+
+        # Extra points very close to airfoil surface (boundary layer)
+        n_bl = 5000  # Increased for better boundary layer resolution
+
+        # Sample in a thin band around airfoil
+        x_bl = torch.rand(n_bl * 5, 1, device=device) * self.chord
+        y_surf_bl = self.airfoil.surface(x_bl)
+        # Add small normal offset (0.5% to 2% chord)
+        offset = 0.005 + 0.015 * torch.rand(n_bl * 5, 1, device=device)
+        y_bl_upper = y_surf_bl + offset * self.chord
+        y_bl_lower = -y_surf_bl - offset * self.chord
+        # Combine and filter
+        x_bl_all = torch.cat([x_bl, x_bl])
+        y_bl_all = torch.cat([y_bl_upper, y_bl_lower])
+        # Take only points outside airfoil
+        mask = ~self.airfoil.is_inside(x_bl_all, y_bl_all)
+        x_bl_final = x_bl_all[mask][:n_bl]
+        y_bl_final = y_bl_all[mask][:n_bl]
+
+        # Extra refinement very close to leading edge (critical for drag)
+        n_le = 500  # leading edge points
+        x_le = torch.rand(n_le, 1, device=device) * 0.1 * self.chord  # First 10% of chord
+        y_surf_le = self.airfoil.surface(x_le)
+        # Very thin layer: 0.1% to 0.5% chord
+        offset_le = 0.001 + 0.004 * torch.rand(n_le, 1, device=device)
+        y_le_upper = y_surf_le + offset_le * self.chord
+        y_le_lower = -y_surf_le - offset_le * self.chord
+
+        # Flatten to 1D for concatenation (x_dom and y_dom are 1D)
+        x_le_flat = x_le.squeeze()  # Convert from (n,1) to (n,)
+        y_le_upper_flat = y_le_upper.squeeze()
+        y_le_lower_flat = y_le_lower.squeeze()
+
+        # Add to domain points - concatenate LE points for both upper and lower
+        x_dom = torch.cat([x_dom, x_le_flat, x_le_flat])  # x_le used twice: once for upper, once for lower
+        y_dom = torch.cat([y_dom, y_le_upper_flat, y_le_lower_flat])
+
+        # Also add boundary layer points (this was missing)
+        x_dom = torch.cat([x_dom, x_bl_final])
+        y_dom = torch.cat([y_dom, y_bl_final])
+
+        y_surf = self.airfoil.surface(x_nodes)
+        x_up = x_nodes.flip(0)            # TE -> LE on upper
+        y_up = y_surf.flip(0)
+        x_lo = x_nodes[1:]                # LE -> TE on lower (skip LE duplicate)
+        y_lo = -y_surf[1:]
+        x_airfoil = torch.cat([x_up, x_lo]).unsqueeze(1)
+        y_airfoil = torch.cat([y_up, y_lo]).unsqueeze(1)
+
+        # Top wall boundary (y = y_max)
+        n_wall = n_boundary // 4
+        x_top = self.x_min + (self.x_max - self.x_min) * torch.rand(n_wall, 1, device=device)
+        y_top = torch.full((n_wall, 1), self.y_max, device=device)
+
+        # Bottom wall boundary (y = y_min)
+        x_bottom = self.x_min + (self.x_max - self.x_min) * torch.rand(n_wall, 1, device=device)
+        y_bottom = torch.full((n_wall, 1), self.y_min, device=device)
+
+        return {
+            'domain': (x_dom, y_dom),
+            'inlet': (x_inlet, y_inlet),
+            'outlet': (x_outlet, y_outlet),
+            'airfoil': (x_airfoil, y_airfoil),
+            'wall_top': (x_top, y_top),
+            'wall_bottom': (x_bottom, y_bottom),
+        }
+
+    def compute_adaptive_weights(self, loss_components, epoch):
+        """Compute adaptive weights with proper constraints for flow problems"""
+        if not self.use_adaptive_weights or epoch < self.warmup_epochs:
+            # Use fixed weights during warmup
+            return {'physics': 100.0, 'inlet': 10.0, 'outlet': 2.0,
+                    'airfoil': 20.0, 'wall': 10.0}
+
+        # Compute gradient norms
+        current_grads = {}
+        for name, loss_tensor in loss_components.items():
+            if loss_tensor.requires_grad and loss_tensor.item() > 1e-10:
+                model_params = list(self.model.parameters())
+                grads = torch.autograd.grad(
+                    loss_tensor,
+                    model_params,
+                    retain_graph=True,
+                    create_graph=False,
+                    allow_unused=True
+                )
+                grad_norm = 0.0
+                for g in grads:
+                    if g is not None:
+                        grad_norm += g.norm().item() ** 2
+                current_grads[name] = np.sqrt(grad_norm) + 1e-10
+
+        # Use faster adaptation to be more responsive
+        alpha = 0.85  # Faster adaptation for better responsiveness
+        for name in self.loss_weights.keys():
+            if name in current_grads:
+                if self.grad_norms[name] is None:
+                    self.grad_norms[name] = current_grads[name]
+                else:
+                    # Add NaN check
+                    new_norm = alpha * self.grad_norms[name] + (1 - alpha) * current_grads[name]
+                    if not np.isnan(new_norm) and not np.isinf(new_norm):
+                        self.grad_norms[name] = new_norm
+                    else:
+                        self.grad_norms[name] = current_grads[name]  # Reset if NaN
+
+        # Compute base weights from gradient balancing
+        valid_grads = {k: v for k, v in self.grad_norms.items()
+                       if v is not None and v > 1e-10}
+
+        if len(valid_grads) > 0:
+            # Use arithmetic mean (more stable than geometric)
+            mean_grad = np.mean(list(valid_grads.values()))
+
+            # More flexible constraints for better adaptation
+            min_weights = {
+                'physics': 20.0,  # Double for better physics enforcement
+                'inlet': 15.0,  # Can reduce since inlet is OK
+                'outlet': 2.0,
+                'airfoil': 40.0,  # Keep high for drag
+                'wall': 3.0
+            }
+
+            # Increased maximum weights for stronger enforcement when needed
+            max_weights = {
+                'physics': 100.0,  # Reduce to prevent over-dominance
+                'inlet': 50.0,  # Keep same
+                'outlet': 20.0,  # Reduce slightly
+                'airfoil': 60.0,  # Reduce from 100 to prevent over-dominance
+                'wall': 20.0
+            }
+            # min_weights = {
+            #     'physics': 10.0,  # Keep physics strong
+            #     'inlet': 5.0,  # NEVER let inlet go below 5!
+            #     'outlet': 1.0,
+            #     'airfoil': 5.0,  # Critical for drag
+            #     'wall': 2.0
+            # }
+            #
+            # # Maximum weights to prevent dominance
+            # max_weights = {
+            #     'physics': 100.0,
+            #     'inlet': 30.0,
+            #     'outlet': 20.0,
+            #     'airfoil': 40.0,
+            #     'wall': 20.0
+            # }
+
+            # Compute adaptive weights with constraints
+            for name in self.loss_weights.keys():
+                if name in valid_grads:
+                    # Base weight from gradient balancing
+                    weight = mean_grad / (valid_grads[name] + 1e-10)
+
+                    # Apply problem-specific scaling - prioritize physics more
+                    if name == 'physics':
+                        weight *= 5.0  # Increase back for better physics
+                    elif name == 'airfoil':
+                        weight *= 2.0  # Increase for better no-slip
+                    elif name == 'inlet':
+                        weight *= 3.0  # Slightly reduce since inlet is OK now
+
+                    # Apply min/max constraints
+                    self.loss_weights[name] = np.clip(
+                        weight,
+                        min_weights[name],
+                        max_weights[name]
+                    )
+
+        # Critical override: ensure inlet BC is always strongly enforced
+        if epoch > self.warmup_epochs:
+            inlet_loss_value = loss_components.get('inlet', torch.tensor(0.0))
+            if isinstance(inlet_loss_value, torch.Tensor):
+                inlet_loss_value = inlet_loss_value.item()
+
+            # Much stricter inlet enforcement
+            if inlet_loss_value > 0.0001:  # Tighter threshold
+                self.loss_weights['inlet'] = min(self.loss_weights['inlet'] * 2.0, 100.0)
+
+            # Ensure minimum weights for critical BCs
+            self.loss_weights['inlet'] = max(self.loss_weights['inlet'], 25.0)
+            self.loss_weights['airfoil'] = max(self.loss_weights['airfoil'], 50.0)
+            self.loss_weights['physics'] = max(self.loss_weights['physics'], 20.0)
+
+        return self.loss_weights
+
+    def reset_adaptive_weights(self):
+        """Reset adaptive weights if training diverges"""
+        self.grad_norms = {k: None for k in self.loss_weights.keys()}
+        self.loss_weights = {
+            'physics': 1.0,
+            'inlet': 1.0,
+            'outlet': 1.0,
+            'airfoil': 1.0,
+            'wall': 1.0
+        }
+        print("Adaptive weights reset to uniform values")
+
+    def compute_losses(self, points, epoch=0):
+        """Compute weighted loss components with adaptive weighting"""
+        # Use mixed precision context
+        with autocast(enabled=self.use_amp):
+            # Physics loss
+            x_dom, y_dom = points['domain']
+            mx, my, cont = self.model.physics_loss(x_dom, y_dom)
+            physics_loss = torch.mean(mx ** 2 + my ** 2 + cont ** 2)
+
+            # Inlet BC: u=1, v=0
+            x_in, y_in = points['inlet']
+            u_in, v_in, _ = self.model(x_in, y_in)
+            inlet_loss = torch.mean((u_in - 1.0) ** 2 + v_in ** 2)
+
+            # Outlet BC: p=0 (reference pressure)
+            x_out, y_out = points['outlet']
+            u_out, v_out, p_out = self.model(x_out, y_out)
+            outlet_loss = torch.mean(p_out ** 2)
+
+            # Airfoil BC: no-slip (u=0, v=0)
+            x_air, y_air = points['airfoil']
+            u_air, v_air, _ = self.model(x_air, y_air)
+            airfoil_loss = torch.mean(u_air ** 2 + v_air ** 2)
+
+            # Wall BC top/bottom
+            if 'wall_top' in points and 'wall_bottom' in points:
+                x_top, y_top = points['wall_top']
+                u_top, v_top, _ = self.model(x_top, y_top)
+                wall_top_loss = torch.mean(u_top ** 2 + v_top ** 2)
+
+                x_bot, y_bot = points['wall_bottom']
+                u_bot, v_bot, _ = self.model(x_bot, y_bot)
+                wall_bottom_loss = torch.mean(u_bot ** 2 + v_bot ** 2)
+
+                wall_loss = wall_top_loss + wall_bottom_loss
+            else:
+                wall_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Store loss components for adaptive weighting
+        loss_components = {
+            'physics': physics_loss,
+            'inlet': inlet_loss,
+            'outlet': outlet_loss,
+            'airfoil': airfoil_loss,
+            'wall': wall_loss
+        }
+
+        # Update weights more frequently for better adaptation
+        if epoch % 5 == 0 or epoch < self.warmup_epochs:
+            weights = self.compute_adaptive_weights(loss_components, epoch)
+        else:
+            weights = self.loss_weights  # Use cached weights
+
+        # Compute weighted total (stay in autocast context)
+        with autocast(enabled=self.use_amp):
+            total_loss = sum(weights[k] * v for k, v in loss_components.items())
+
+        # Prepare output dictionary
+        loss_dict = {k: v.item() for k, v in loss_components.items()}
+        loss_dict['total'] = total_loss.item()
+
+        # Add weights to history
+        weight_dict = {f'w_{k}': weights[k] for k in weights.keys()}
+        loss_dict.update(weight_dict)
+
+        return total_loss, loss_dict
+
+    def refine_with_lbfgs(self, iterations=500):
+        """Fine-tune with L-BFGS for better convergence"""
+        print("\nRefining with L-BFGS...")
+        optimizer = torch.optim.LBFGS(
+            self.model.parameters(),
+            lr=1.0,
+            max_iter=20,
+            history_size=50,
+            line_search_fn='strong_wolfe'
+        )
+
+        pool = self.generate_collocation_points(n_domain=20000, n_boundary=4000)
+
+        def closure():
+            optimizer.zero_grad()
+            loss, _ = self.compute_losses(pool)
+            loss.backward()
+            return loss
+
+        for i in range(iterations):
+            loss = optimizer.step(closure)
+            if (i + 1) % 50 == 0:
+                print(f"  L-BFGS iter {i + 1}: Loss = {loss.item():.6f}")
+
+    def train(self, epochs=5000, print_every=200, batch_dom=4096, batch_bnd=1024):
+        """Mini-batch training with mixed precision and optimizations"""
+        print("Starting optimized training...")
+        print(f"  Mixed Precision: {self.use_amp}")
+        print(f"  Batch sizes: domain={batch_dom}, boundary={batch_bnd}")
+
+        start_time = time.time()
+
+        # Build initial pool with more points
+        #pool = self.generate_collocation_points(n_domain=60000, n_boundary=12000)  # Reduced for speed
+        pool = self.generate_collocation_points(n_domain=80000, n_boundary=16000)
+
+        def sample_batch(x, y, n):
+            idx = torch.randint(0, x.shape[0], (n,), device=device)
+            # Don't detach - keep gradient graph if needed
+            x_batch = x[idx].clone()
+            y_batch = y[idx].clone()
+            return x_batch, y_batch
+
+        for epoch in range(epochs):
+            # Sample mini-batches
+            x_dom_b, y_dom_b = sample_batch(*pool['domain'], batch_dom)
+            x_in_b, y_in_b = sample_batch(*pool['inlet'], batch_bnd // 2)
+            x_out_b, y_out_b = sample_batch(*pool['outlet'], batch_bnd // 2)
+            x_air_b, y_air_b = sample_batch(*pool['airfoil'], batch_bnd)
+            x_top_b, y_top_b = sample_batch(*pool['wall_top'], batch_bnd // 2)
+            x_bot_b, y_bot_b = sample_batch(*pool['wall_bottom'], batch_bnd // 2)
+
+            batch = {
+                'domain': (x_dom_b, y_dom_b),
+                'inlet': (x_in_b, y_in_b),
+                'outlet': (x_out_b, y_out_b),
+                'airfoil': (x_air_b, y_air_b),
+                'wall_top': (x_top_b, y_top_b),
+                'wall_bottom': (x_bot_b, y_bot_b),
+            }
+
+            # Forward pass with mixed precision
+            self.optimizer.zero_grad()
+
+            # Ensure domain points have gradients for physics loss
+            x_dom_b = x_dom_b.requires_grad_(True)
+            y_dom_b = y_dom_b.requires_grad_(True)
+            batch['domain'] = (x_dom_b, y_dom_b)
+
+            # Use autocast for forward pass
+            with autocast(enabled=self.use_amp):
+                total_loss, loss_dict = self.compute_losses(batch, epoch=epoch)
+
+            # Backward pass with gradient scaling
+            self.scaler.scale(total_loss).backward()
+
+            # Unscale before gradient clipping
+            self.scaler.unscale_(self.optimizer)
+            #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=5.0)
+
+            # Optimizer step with scaler
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+
+            # Scheduler step for CosineAnnealingLR (call every epoch)
+            self.scheduler.step()
+
+            # Log
+            self.loss_history.append(loss_dict)
+
+            # Print progress
+            if (epoch + 1) % print_every == 0:
+                elapsed = time.time() - start_time
+                current_lr = self.optimizer.param_groups[0]['lr']
+                iter_per_sec = (epoch + 1) / elapsed
+
+                print(
+                    f"Epoch {epoch + 1}/{epochs}, Time: {elapsed:.1f}s, Speed: {iter_per_sec:.1f} it/s, LR: {current_lr:.2e}")
+                print(f"  Total: {loss_dict['total']:.6f} | Phys: {loss_dict['physics']:.6f} | "
+                      f"Inlet: {loss_dict['inlet']:.6f} | Outlet: {loss_dict['outlet']:.6f} | "
+                      f"Foil: {loss_dict['airfoil']:.6f} | Wall: {loss_dict.get('wall', 0.0):.6f}")
+
+                # Print adaptive weights if active
+                if self.use_adaptive_weights and epoch >= self.warmup_epochs:
+                    print(f"  Weights - Phys: {loss_dict['w_physics']:.1f} | In: {loss_dict['w_inlet']:.1f} | "
+                          f"Out: {loss_dict['w_outlet']:.1f} | Foil: {loss_dict['w_airfoil']:.1f} | "
+                          f"Wall: {loss_dict['w_wall']:.1f}")
+
+                # Check inlet BC satisfaction
+                with torch.no_grad():
+                    x_test = torch.full((100, 1), self.x_min, device=device)
+                    y_test = torch.linspace(self.y_min, self.y_max, 100, device=device).reshape(-1, 1)
+                    u_test, v_test, _ = self.model(x_test, y_test)
+                    u_mean = u_test.mean().item()
+                    print(f"  Inlet check: mean(u) = {u_mean:.3f} (target=1.0)")
+
+            # More frequent adaptive sampling after warmup
+            adaptive_freq = 200 if epoch > self.adaptive_start_epoch else 500
+            if (epoch + 1) % adaptive_freq == 0:
+                # Apply adaptive sampling if enabled and after warmup
+                if self.use_residual_adaptive and epoch >= self.adaptive_start_epoch:
+                    # Compute residuals on current domain points
+                    x_dom, y_dom = pool['domain']
+                    # Sample subset for residual evaluation
+                    n_eval = min(10000, len(x_dom))
+                    idx = torch.randperm(len(x_dom))[:n_eval]
+                    x_eval = x_dom[idx].clone().requires_grad_(True)
+                    y_eval = y_dom[idx].clone().requires_grad_(True)
+
+                    # Compute residuals (needs gradients, so outside no_grad)
+                    mx, my, cont = self.model.physics_loss(x_eval, y_eval)
+
+                    with torch.no_grad():
+                        residuals = (mx ** 2 + my ** 2 + cont ** 2).squeeze()
+
+                        # Fix for quantile error - use alternative approaches
+                        try:
+                            # Try using quantile if tensor is small enough
+                            if residuals.numel() < 100000:  # Limit for safe quantile computation
+                                threshold = torch.quantile(residuals, 0.9)  # Top 10%
+                            else:
+                                # Alternative: use topk for large tensors
+                                k = max(1, int(0.1 * residuals.numel()))  # Top 10%
+                                top_values, _ = torch.topk(residuals.flatten(), k)
+                                threshold = top_values[-1]  # Minimum of top 10%
+                        except RuntimeError:
+                            # Fallback: use mean + std
+                            threshold = residuals.mean() + 2.0 * residuals.std()
+
+                        high_res_mask = residuals > threshold
+
+                        # Rest of the adaptive sampling code remains the same...
+                        n_adaptive = 80000 // 4  # 25% adaptive
+                        if high_res_mask.sum() > 0:
+                            # Add points near high residual locations
+                            x_high = x_eval[high_res_mask]
+                            y_high = y_eval[high_res_mask]
+
+                            # Add gaussian noise to create cloud around high residual points
+                            noise_scale = 0.1  # 10% of domain size
+                            x_adaptive = []
+                            y_adaptive = []
+                            for i in range(min(n_adaptive, len(x_high) * 10)):
+                                idx = i % len(x_high)
+                                x_new = x_high[idx] + torch.randn(1, device=device) * noise_scale
+                                y_new = y_high[idx] + torch.randn(1, device=device) * noise_scale
+                                # Check bounds and airfoil
+                                if (self.x_min <= x_new <= self.x_max and
+                                        self.y_min <= y_new <= self.y_max):
+                                    if not self.airfoil.is_inside(x_new.unsqueeze(0), y_new.unsqueeze(0)):
+                                        x_adaptive.append(x_new)
+                                        y_adaptive.append(y_new)
+
+                            if x_adaptive:
+                                x_adaptive = torch.cat(x_adaptive)
+                                y_adaptive = torch.cat(y_adaptive)
+
+                                # Generate remaining random points
+                                n_random = 80000 - len(x_adaptive)
+                                pool_new = self.generate_collocation_points(n_domain=n_random, n_boundary=16000)
+
+                                # Combine adaptive and random
+                                pool['domain'] = (
+                                    torch.cat([x_adaptive, pool_new['domain'][0]]),
+                                    torch.cat([y_adaptive, pool_new['domain'][1]])
+                                )
+
+                                print(f"  Adaptive sampling: added {len(x_adaptive)} points near high residuals")
+                                print(f"  Max residual: {residuals.max():.6f}, Mean: {residuals.mean():.6f}")
+                            else:
+                                pool = self.generate_collocation_points(n_domain=80000, n_boundary=16000)
+                        else:
+                            pool = self.generate_collocation_points(n_domain=80000, n_boundary=16000)
+                else:
+                    pool = self.generate_collocation_points(n_domain=80000, n_boundary=16000)
+
+
+
+        print(f"\nTraining completed in {time.time() - start_time:.1f} seconds")
+        print(f"Average speed: {epochs / (time.time() - start_time):.1f} iterations/second")
+
+    def predict(self, x, y):
+        """Predict flow variables at given points (numpy arrays)"""
+        x_tensor = torch.tensor(x, dtype=torch.float32, device=device).reshape(-1, 1)
+        y_tensor = torch.tensor(y, dtype=torch.float32, device=device).reshape(-1, 1)
+
+        self.model.eval()
+        with torch.no_grad():
+            u, v, p = self.model(x_tensor, y_tensor)
+
+        u = u.detach().cpu().numpy().reshape(x.shape)
+        v = v.detach().cpu().numpy().reshape(x.shape)
+        p = p.detach().cpu().numpy().reshape(x.shape)
+        return u, v, p
+
+    def estimate_p_inlet_mean(self, n=512):
+        """Estimate reference pressure as mean p at the inlet"""
+        x = np.full((n, 1), self.x_min, dtype=np.float32)
+        y = np.linspace(self.y_min, self.y_max, n, dtype=np.float32).reshape(-1, 1)
+        _, _, p = self.predict(x, y)
+        return float(np.mean(p))
+
+    def compute_pressure_coefficient(self, n_points=200):
+        """Compute Cp distribution with better surface sampling"""
+        # Use cosine clustering for better LE resolution
+        theta = np.linspace(0, np.pi, n_points)
+        x_surf = 0.5 * (1 + np.cos(theta)) * self.chord
+
+        # Get surface y-coordinates
+        y_surf = self.airfoil.surface(torch.tensor(x_surf, dtype=torch.float32)).cpu().numpy()
+
+        # Sample slightly off surface to avoid singularities (0.1% chord)
+        offset = 0.001 * self.chord
+
+        # Predict pressures
+        _, _, p_upper = self.predict(x_surf, y_surf + offset)
+        _, _, p_lower = self.predict(x_surf, -y_surf - offset)
+
+        # Get inlet conditions for reference
+        p_inf = self.estimate_p_inlet_mean(n=512)
+        u_inf = 1.0
+
+        # Correct dynamic pressure (no density factor needed for incompressible)
+        q_inf = 0.5 * u_inf ** 2
+
+        # Pressure coefficient
+        cp_upper = (p_upper - p_inf) / q_inf
+        cp_lower = (p_lower - p_inf) / q_inf
+
+        return x_surf / self.chord, cp_upper, cp_lower
+
+    def compute_force_coefficients(self, n_points=1200):
+        # Cosine-clustered nodes in x ∈ [0, 1]
+        s = torch.linspace(0.0, np.pi, n_points // 2 + 1, device=device)
+        x_nodes = 0.5 * (1.0 - torch.cos(s)) * self.chord
+
+        # Closed CCW contour: TE→LE on upper, then LE→TE on lower
+        x_up = torch.flip(x_nodes, dims=[0])
+        y_up = self.airfoil.surface(x_up)
+        x_lo = x_nodes[1:]
+        y_lo = -self.airfoil.surface(x_lo)
+
+        x_c = torch.cat([x_up, x_lo]).unsqueeze(1).requires_grad_(True)
+        y_c = torch.cat([y_up, y_lo]).unsqueeze(1).requires_grad_(True)
+
+        # Network + grads
+        u, v, p = self.model(x_c, y_c)
+        u_x = torch.autograd.grad(u, x_c, torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        u_y = torch.autograd.grad(u, y_c, torch.ones_like(u), retain_graph=True, create_graph=True)[0]
+        v_x = torch.autograd.grad(v, x_c, torch.ones_like(v), retain_graph=True, create_graph=True)[0]
+        v_y = torch.autograd.grad(v, y_c, torch.ones_like(v), retain_graph=True, create_graph=True)[0]
+
+        mu = 1.0 / self.Re
+        sig_xx = -p + 2.0 * mu * u_x
+        sig_xy = mu * (u_y + v_x)
+        sig_yy = -p + 2.0 * mu * v_y
+
+        # Detach to numpy for geometry/integration
+        x_c_np = x_c.detach().cpu().numpy().ravel()
+        y_c_np = y_c.detach().cpu().numpy().ravel()
+        sig_xx = sig_xx.detach().cpu().numpy().ravel()
+        sig_xy = sig_xy.detach().cpu().numpy().ravel()
+        sig_yy = sig_yy.detach().cpu().numpy().ravel()
+
+        # Tangent, outward normal for CCW curve
+        dx = np.gradient(x_c_np)
+        dy = np.gradient(y_c_np)
+        ds = np.sqrt(dx ** 2 + dy ** 2) + 1e-12
+        tx, ty = dx / ds, dy / ds
+        nx, ny = ty, -tx  # outward for CCW
+
+        # Traction and integrate over arc length
+        t_x = sig_xx * nx + sig_xy * ny
+        t_y = sig_xy * nx + sig_yy * ny
+        s_coord = np.concatenate(([0.0], np.cumsum(np.sqrt(np.diff(x_c_np) ** 2 + np.diff(y_c_np) ** 2))))
+        Fx = np.trapz(t_x, s_coord)
+        Fy = np.trapz(t_y, s_coord)
+
+        U_inf = 1.0
+        q_inf = 0.5 * U_inf ** 2
+        cd = Fx / (q_inf * self.chord)
+        cl = Fy / (q_inf * self.chord)
+        return cl, cd
+
+    def extract_wake_profile(self, x_wake=2.0, n_points=200):
+        """Extract velocity profile u(y) at a downstream x-location"""
+        y_wake = np.linspace(self.y_min, self.y_max, n_points)
+        x_wake_arr = np.full_like(y_wake, x_wake)
+        u_wake, v_wake, _ = self.predict(x_wake_arr, y_wake)
+        return y_wake, u_wake, v_wake
+
+    def visualize_results(self, save_figs=True):
+        """Generate visualization plots"""
+        print("\nGenerating visualizations...")
+
+        # Mesh
+        nx, ny = 200, 120
+        x = np.linspace(self.x_min, self.x_max, nx)
+        y = np.linspace(self.y_min, self.y_max, ny)
+        X, Y = np.meshgrid(x, y)
+
+        # Predict field
+        u, v, p = self.predict(X, Y)
+        speed = np.sqrt(u**2 + v**2)
+
+        # Mask airfoil region
+        inside = self.airfoil.is_inside(torch.tensor(X, dtype=torch.float32),
+                                        torch.tensor(Y, dtype=torch.float32),
+                                        pitch=self.pitch).cpu().numpy()
+        u[inside] = np.nan
+        v[inside] = np.nan
+        p[inside] = np.nan
+        speed[inside] = np.nan
+
+        # Airfoil outline (for plotting)
+        theta = np.linspace(0, 2 * np.pi, 400)
+        x_foil = 0.5 * (1 + np.cos(theta)) * self.chord
+        y_foil = self.airfoil.surface(torch.tensor(x_foil, dtype=torch.float32)).cpu().numpy()
+
+        fig = plt.figure(figsize=(16, 12))
+
+        # 1. Streamlines
+        ax1 = plt.subplot(3, 2, 1)
+        try:
+            strm = ax1.streamplot(X, Y, u, v, color=speed, cmap='viridis', density=2, linewidth=1, arrowsize=1)
+            plt.colorbar(strm.lines, ax=ax1, label='Velocity magnitude')
+        except Exception:
+            # Fallback if NaNs cause issues in streamplot
+            cs = ax1.contourf(X, Y, speed, levels=30, cmap='viridis')
+            plt.colorbar(cs, ax=ax1, label='Velocity magnitude')
+
+        ax1.fill(x_foil, y_foil, 'k', alpha=0.8)
+        ax1.fill(x_foil, -y_foil, 'k', alpha=0.8)
+        ax1.set_xlim(self.x_min, self.x_max)
+        ax1.set_ylim(self.y_min, self.y_max)
+        ax1.set_xlabel('x/c')
+        ax1.set_ylabel('y/c')
+        ax1.set_title('Streamlines')
+        ax1.set_aspect('equal')
+
+        # 2. Pressure field
+        ax2 = plt.subplot(3, 2, 2)
+        levels = np.linspace(np.nanmin(p), np.nanmax(p), 30)
+        cp = ax2.contourf(X, Y, p, levels=levels, cmap='RdBu_r', extend='both')
+        plt.colorbar(cp, ax=ax2, label='Pressure')
+        ax2.fill(x_foil, y_foil, 'k', alpha=0.8)
+        ax2.fill(x_foil, -y_foil, 'k', alpha=0.8)
+        ax2.set_xlim(self.x_min, self.x_max)
+        ax2.set_ylim(self.y_min, self.y_max)
+        ax2.set_xlabel('x/c')
+        ax2.set_ylabel('y/c')
+        ax2.set_title('Pressure Field')
+        ax2.set_aspect('equal')
+
+        # 3. Velocity magnitude
+        ax3 = plt.subplot(3, 2, 3)
+        levels = np.linspace(np.nanmin(speed), np.nanmax(speed), 30)
+        cv = ax3.contourf(X, Y, speed, levels=levels, cmap='jet')
+        plt.colorbar(cv, ax=ax3, label='|V|/U∞')
+        ax3.fill(x_foil, y_foil, 'k', alpha=0.8)
+        ax3.fill(x_foil, -y_foil, 'k', alpha=0.8)
+        ax3.set_xlim(self.x_min, self.x_max)
+        ax3.set_ylim(self.y_min, self.y_max)
+        ax3.set_xlabel('x/c')
+        ax3.set_ylabel('y/c')
+        ax3.set_title('Velocity Magnitude')
+        ax3.set_aspect('equal')
+
+        # 4. Cp distribution
+        ax4 = plt.subplot(3, 2, 4)
+        x_cp, cp_upper, cp_lower = self.compute_pressure_coefficient()
+        ax4.plot(x_cp, -cp_upper, 'b-', label='Upper surface', linewidth=2)
+        ax4.plot(x_cp, -cp_lower, 'r--', label='Lower surface', linewidth=2)
+        ax4.set_xlabel('x/c')
+        ax4.set_ylabel('-Cp')
+        ax4.set_title('Pressure Coefficient Distribution')
+        ax4.grid(True, alpha=0.3)
+        ax4.legend()
+        ax4.set_xlim(0, 1)
+
+        # 5. Wake profiles at multiple x
+        ax5 = plt.subplot(3, 2, 5)
+        for x_wake in [1.5, 2.0, 3.0]:
+            y_wake, u_wake, _ = self.extract_wake_profile(x_wake)
+            ax5.plot(u_wake, y_wake, label=f'x/c = {x_wake}', linewidth=2)
+        ax5.axvline(x=1.0, color='k', linestyle='--', alpha=0.5)
+        ax5.set_xlabel('u/U∞')
+        ax5.set_ylabel('y/c')
+        ax5.set_title('Wake Velocity Profiles')
+        ax5.grid(True, alpha=0.3)
+        ax5.legend()
+        ax5.set_ylim(self.y_min, self.y_max)
+
+        # 6. Loss history with adaptive weights
+        ax6 = plt.subplot(3, 2, 6)
+        if self.loss_history:
+            losses = np.array([[l['physics'], l['inlet'], l['outlet'],
+                                l['airfoil'], l.get('wall', 0.0)]
+                               for l in self.loss_history])
+
+            # Create twin axis for weights
+            ax6_twin = ax6.twinx()
+
+            # Plot losses on left axis
+            ax6.semilogy(losses[:, 0], 'b-', label='Physics', linewidth=1.5, alpha=0.7)
+            ax6.semilogy(losses[:, 1], 'g-', label='Inlet BC', linewidth=1.5, alpha=0.7)
+            ax6.semilogy(losses[:, 3], 'r-', label='Airfoil BC', linewidth=1.5, alpha=0.7)
+
+            # Plot weights on right axis if available
+            if self.use_adaptive_weights and any('w_physics' in l for l in self.loss_history):
+                weights = np.array([[l.get('w_physics', 1.0), l.get('w_inlet', 1.0),
+                                     l.get('w_airfoil', 1.0)]
+                                    for l in self.loss_history])
+                ax6_twin.plot(weights[:, 0], 'b--', linewidth=1, alpha=0.5)
+                ax6_twin.plot(weights[:, 1], 'g--', linewidth=1, alpha=0.5)
+                ax6_twin.plot(weights[:, 2], 'r--', linewidth=1, alpha=0.5)
+                ax6_twin.set_ylabel('Adaptive Weights', color='gray')
+                ax6_twin.tick_params(axis='y', labelcolor='gray')
+
+            ax6.set_xlabel('Iteration')
+            ax6.set_ylabel('Loss')
+            ax6.set_title('Training Convergence & Adaptive Weights')
+            ax6.grid(True, alpha=0.3)
+            ax6.legend(loc='upper left')
+
+        plt.tight_layout()
+        if save_figs:
+            plt.savefig('cascade_flow_results.png', dpi=150, bbox_inches='tight')
+            print("Results saved to 'cascade_flow_results.png'")
+        plt.show()
+
+        # Forces
+        cl, cd = self.compute_force_coefficients()
+        print(f"\nForce Coefficients:")
+        print(f"  Lift coefficient (Cl): {cl:.6f}")
+        print(f"  Drag coefficient (Cd): {cd:.6f}")
+        if abs(cd) > 1e-12:
+            print(f"  L/D ratio: {cl / cd:.2f}")
+
+        return fig
+
+
+def main():
+    print("=" * 60)
+    print("PINN Simulation: NACA 0012 Cascade Flow")
+    print("=" * 60)
+    print(f"Reynolds number: Re = 200")
+    print(f"Chord length: c = 1.0")
+    print(f"Solidity: σ = 1.0")
+    print(f"Angle of attack: α = 0°")
+    print(f"Boundary conditions: No-slip walls (top/bottom), p=0 at outlet")
+    print("=" * 60)
+
+    solver = CascadeFlowSolver(Re=200, chord=1.0, solidity=1.0)
+
+    # Train
+    # Train with more points
+    #solver.train(epochs=5000, print_every=500, batch_dom=8192, batch_bnd=2048)
+    # Optimized training parameters for RTX 3080
+    solver.train(epochs=8000, print_every=500, batch_dom=8192, batch_bnd=2048)
+    #solver.refine_with_lbfgs(iterations=200)
+
+    # Visualize and post-process
+    fig = solver.visualize_results(save_figs=True)
+
+    print("\n" + "=" * 60)
+    print("Analysis Complete!")
+    print("=" * 60)
+
+    return solver, fig
+
+
+if __name__ == "__main__":
+    solver, fig = main()
